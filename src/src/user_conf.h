@@ -3,7 +3,7 @@
 
 // Display options.
 #define PRINTER_NAME       "ZEROD"
-#define DISPLAY_BRIGHTNESS 8
+#define DISPLAY_BRIGHTNESS 128
 
 // Overlay side indicators.
 #define SHOW_SIDE_ARCS     1

@@ -5,6 +5,8 @@
 #include "ui/ui.h"
 #include "user_conf.h"
 
+#include "core/lv_obj_event_private.h"
+
 namespace ui {
 namespace overlay {
 

@@ -1,18 +1,17 @@
 #include "display.h"
+#include "display.hpp"
 
 #include <lvgl.h>
-#include <TFT_eSPI.h>
 
 #include "board_conf.h"
-#include "cst816s.h"
 
 namespace display {
 
-static TFT_eSPI *_tft = nullptr;
+static LGFX _tft;
 static lv_display_t *_lvd = nullptr;
 
-static lv_color_t _buf1[RES_H * RES_V / 10];
-static lv_color_t _buf2[RES_H * RES_V / 10];
+static lv_color_t _buf1[SCREEN_WIDTH * SCREEN_HEIGHT / 10];
+static lv_color_t _buf2[SCREEN_WIDTH * SCREEN_HEIGHT / 10];
 
 static lv_indev_t *_indev = nullptr;
 
@@ -20,17 +19,13 @@ void _flush_display(lv_display_t *display, const lv_area_t *area, uint8_t *color
 void _read_touchscreen(lv_indev_t *indev, lv_indev_data_t *data);
 
 void init() {
-  pinMode(LCD_BL_PIN, OUTPUT);
+  _tft.init();
+  _tft.setBrightness(0);
 
-  _tft = new TFT_eSPI();
-  _tft->init();
-  set_backlight(0);
-
-  _lvd = lv_display_create(RES_H, RES_V);
+  _lvd = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
+  lv_display_set_color_format(_lvd, LV_COLOR_FORMAT_RGB565);
   lv_display_set_buffers(_lvd, _buf1, _buf2, sizeof(_buf1), LV_DISPLAY_RENDER_MODE_PARTIAL);
   lv_display_set_flush_cb(_lvd, _flush_display);
-
-  cst816s::init(); 
 
   _indev = lv_indev_create();
   lv_indev_set_type(_indev, LV_INDEV_TYPE_POINTER);
@@ -39,73 +34,33 @@ void init() {
   lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x000000), LV_STATE_DEFAULT);
 }
 
-void destroy() {
-  lv_indev_delete(_indev);
-  _indev = nullptr;
-
-  lv_display_delete(_lvd);
-  _lvd = nullptr;
-
-  delete _tft;
-  _tft = nullptr;
-}
-
 void set_backlight(uint8_t target) {
-  static uint8_t current = 0;
-  if (target > 16) {
-    target = 16;
-  }
-
-  if (target == current) {
-    return;
-  }
-
-  if (target == 0) {
-    digitalWrite(LCD_BL_PIN, LOW);
-    delay(3);
-    current = 0;
-    return;
-  }
-
-  if (current == 0) {
-    digitalWrite(LCD_BL_PIN, HIGH);
-    delayMicroseconds(25);
-    current = 16;
-  }
-
-  uint8_t cycles = (current >= target) ? current - target : current + 16 - target;
-  for (uint8_t i = 0; i < cycles; i ++) {
-    digitalWrite(LCD_BL_PIN, LOW);
-    delayMicroseconds(1);
-    digitalWrite(LCD_BL_PIN, HIGH);
-    delayMicroseconds(1);
-  }
-
-  current = target;
+  _tft.setBrightness(target);
 }
 
 void _flush_display(lv_display_t *display, const lv_area_t *area, uint8_t *color) {
-  uint32_t w = area->x2 - area->x1 + 1;
-  uint32_t h = area->y2 - area->y1 + 1;
+  uint32_t w = lv_area_get_width(area);
+  uint32_t h = lv_area_get_height(area);
+  lv_draw_sw_rgb565_swap(color, w * h);
 
-  _tft->startWrite();
-  _tft->setAddrWindow(area->x1, area->y1, w, h);
-  _tft->pushColors((uint16_t*) color, w * h, true);
-  _tft->endWrite();
+  if (_tft.getStartCount() == 0) {
+    _tft.endWrite();
+  }
 
-  lv_disp_flush_ready(display);
+  _tft.pushImageDMA(area->x1, area->y1, w, h, (uint16_t *)color);
+  lv_display_flush_ready(display);
 }
 
 void _read_touchscreen(lv_indev_t *indev, lv_indev_data_t *data) {
-  if (!cst816s::ready()) {
-    return;
-  }
+  uint16_t touchX, touchY;
+  bool touched = _tft.getTouch(&touchX, &touchY);
 
-  bool pressed = cst816s::read(data->point.x, data->point.y);
-  if (pressed) {
-    data->state = LV_INDEV_STATE_PRESSED;
-  } else {
+  if (!touched) {
     data->state = LV_INDEV_STATE_RELEASED;
+  } else {
+    data->state = LV_INDEV_STATE_PRESSED;
+    data->point.x = touchX;
+    data->point.y = touchY;
   }
 }
 

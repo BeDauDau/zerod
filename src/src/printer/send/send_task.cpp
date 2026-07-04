@@ -15,29 +15,24 @@ namespace send {
 
 namespace Commands {
 
-const char *kPrefix = "ZEROD_CMD:";
-const char *kStop = "STOP";
 const char *kRestart = "RESTART";
-const char *kGcode = "GCODE:";
-const char *kMove = "MOVE:";
 
 }
-
-
-void _send(const char *cmd);
 
 void send_task(void *param) {
   _semaphore = xSemaphoreCreateMutex();
   while (true) {
     xSemaphoreTake(_semaphore, portMAX_DELAY);
     if (_stop) {
-      _send(Commands::kStop);
+      Serial.print("STOP\r\n");
       _stop = false;
       _queue.clear();
     }
     if (!_queue.empty()) {
       for (const std::string &cmd : _queue) {
-        _send(cmd.c_str());
+        Serial.print(cmd.c_str());
+        Serial.print('\r');
+        Serial.print('\n');
       }
       _queue.clear();
     }
@@ -53,25 +48,21 @@ void send_stop() {
 }
 
 void send_gcode(const char *gcode) {
-  std::string cmd = Commands::kGcode;
-  cmd.append(gcode);
-  send_cmd(cmd.c_str());
+  xSemaphoreTake(_semaphore, portMAX_DELAY);
+  _queue.push_back(std::string("GCODE ") + gcode);
+  xSemaphoreGive(_semaphore);
 }
 
 void send_move(const char *dir) {
-  std::string cmd = Commands::kMove;
-  cmd.append(dir);
-  send_cmd(cmd.c_str());
+  xSemaphoreTake(_semaphore, portMAX_DELAY);
+  _queue.push_back(std::string("MOVE ") + dir);
+  xSemaphoreGive(_semaphore);
 }
 
 void send_cmd(const char *cmd) {
   xSemaphoreTake(_semaphore, portMAX_DELAY);
   _queue.push_back(cmd);
   xSemaphoreGive(_semaphore);
-}
-
-void _send(const char *cmd) {
-  Serial.printf("%s%s\n", Commands::kPrefix, cmd);
 }
 
 }

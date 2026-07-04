@@ -6,11 +6,7 @@ namespace send {
 
 namespace Commands {
 
-extern const char *kPrefix;
-extern const char *kStop;
 extern const char *kRestart;
-extern const char *kGcode;
-extern const char *kMove;
 
 }
 

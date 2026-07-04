@@ -23,8 +23,6 @@ void ui_task(void *param) {
     });
     delay(5);
   }
-
-  display::destroy();
 }
 
 }

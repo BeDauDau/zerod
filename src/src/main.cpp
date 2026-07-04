@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <Wire.h>
 
 #include "board_conf.h"
 #include "printer/printer.h"
@@ -11,7 +10,6 @@
 void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
   Serial.setTimeout(SERIAL_TIMEOUT);
-  Wire.begin(I2C0_SDA_PIN, I2C0_SCL_PIN, I2C0_SPEED);
 
   xTaskCreate(
     ui::ui_task,
