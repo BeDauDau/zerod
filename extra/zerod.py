@@ -1,39 +1,36 @@
-"""Klipper extra module for ZeroD."""
+"""Klipper extra module for ZeroD.
+
+Text-based pipe-delimited protocol matching the ESP32-C3 firmware.
+Serial I/O runs on a background thread to avoid blocking the reactor.
+"""
 
 import dataclasses
 import enum
+import queue
+import threading
+
 import serial
-import struct
-from typing import List
 
 
 _BAUD_RATE = 115200
-_HEADER = b"\x83\xad\x83\xad"
-_FOOTER = b"\xf0\x07\xf0\x07"
 
-_RECV_PERIOD = 0.1
+_RECV_PERIOD = 0.05
 _SEND_PERIOD = 0.1
 
 _GCODES_MAX_LEN = 255
 
-_CMD_PREFIX = b"ZEROD_CMD:"
-_CMD_STOP = b"STOP"
-_CMD_RESTART = b"RESTART"
-_CMD_GCODE = b"GCODE:"
-_CMD_MOVE = b"MOVE:"
-
 
 class PrinterStatus(enum.Enum):
   DISCONNECTED = 0x00
-  IDLE         = 0x01
-  PRINTING     = 0x02
-  SHUTDOWN     = 0x03
+  IDLE = 0x01
+  PRINTING = 0x02
+  SHUTDOWN = 0x03
 
 
 class PrinterTramType(enum.Enum):
   NONE = 0x00
-  ZTA  = 0x01
-  QGL  = 0x02
+  ZTA = 0x01
+  QGL = 0x02
 
 
 @dataclasses.dataclass(frozen=True)
@@ -59,7 +56,7 @@ class PrinterState:
 
   tram_type: PrinterTramType = PrinterTramType.NONE
 
-  gcodes: bytes = b""
+  gcodes: str = ""
 
 
 class ZeroD:
@@ -71,18 +68,24 @@ class ZeroD:
 
     self.gcode = None
     self.heaters = None
-    self.sensors = None
     self.toolhead = None
     self.virtual_sdcard = None
     self.print_stats = None
 
     self.serial = None
     self.update_timer = None
+    self.read_timer = None
     self.last_busy = 0
-    self.pending_cmd = b""
+    self.pending_line = ""
+
+    # Background write thread (keeps serial writes off the reactor thread)
+    self._write_queue = queue.Queue(maxsize=16)
+    self._write_thread = None
+    self._write_stop = threading.Event()
+    self._write_error = False
 
     self.tram_type = PrinterTramType.NONE
-    self.gcodes = b""
+    self.gcodes = ""
 
     self.config_serial = config.get("serial")
 
@@ -108,10 +111,9 @@ class ZeroD:
     ]
 
     self.config_gcodes = config.get("gcodes", "")
-    gcodes = [gcode.strip() for gcode in self.config_gcodes.split(",")]
-    gcodes = [gcode for gcode in gcodes if gcode]
-    gcodes = "\n".join(gcodes)
-    self.gcodes = gcodes.encode("utf-8")
+    gcodes = [g.strip() for g in self.config_gcodes.split(",")]
+    gcodes = [g for g in gcodes if g]
+    self.gcodes = "\n".join(gcodes)
     if len(self.gcodes) > _GCODES_MAX_LEN:
       raise config.error(
           f"Too many G-codes specified ({len(self.gcodes)} > "
@@ -120,17 +122,32 @@ class ZeroD:
 
     self.printer.register_event_handler("klippy:connect", self._handle_connect)
     self.printer.register_event_handler("klippy:ready", self._handle_ready)
-    self.printer.register_event_handler(
-        "klippy:shutdown",
-        self._handle_shutdown,
-    )
-    self.printer.register_event_handler(
-        "klippy:disconnect",
-        self._handle_disconnect,
-    )
+    self.printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
+    self.printer.register_event_handler("klippy:disconnect", self._handle_disconnect)
 
   def _handle_connect(self):
-    self.serial = serial.Serial(self.config_serial, _BAUD_RATE)
+    self.serial = serial.Serial(self.config_serial, _BAUD_RATE, timeout=0)
+    self._write_error = False
+    self._write_stop.clear()
+    self._write_thread = threading.Thread(target=self._write_worker, daemon=True)
+    self._write_thread.start()
+
+  def _write_worker(self):
+    """Background thread: drains the write queue and sends to serial."""
+    while not self._write_stop.is_set():
+      try:
+        line = self._write_queue.get(timeout=0.25)
+      except queue.Empty:
+        continue
+      if line is None:  # sentinel → shutdown
+        break
+      if not self.serial or not self.serial.is_open:
+        continue
+      try:
+        self.serial.write(line.encode("utf-8"))
+      except serial.SerialException:
+        self._write_error = True
+        break
 
   def _handle_ready(self):
     self.gcode = self.printer.lookup_object("gcode")
@@ -147,12 +164,10 @@ class ZeroD:
       self.tram_type = PrinterTramType.NONE
 
     self.update_timer = self.reactor.register_timer(
-        self._handle_update,
-        self.reactor.NOW,
+        self._handle_update, self.reactor.NOW,
     )
     self.read_timer = self.reactor.register_timer(
-        self._handle_read,
-        self.reactor.NOW,
+        self._handle_read, self.reactor.NOW,
     )
 
   def _handle_shutdown(self):
@@ -160,6 +175,13 @@ class ZeroD:
 
   def _handle_disconnect(self):
     self._send_state(PrinterState(status=PrinterStatus.DISCONNECTED))
+    self._write_stop.set()
+    try:
+      self._write_queue.put_nowait(None)
+    except queue.Full:
+      pass
+    if self._write_thread:
+      self._write_thread.join(timeout=2)
     if self.serial:
       self.serial.close()
 
@@ -169,16 +191,26 @@ class ZeroD:
 
   def _handle_read(self, eventtime):
     if not self.serial or not self.serial.is_open:
-      return
+      return eventtime + _RECV_PERIOD
 
-    while self.serial.in_waiting:
-      char = self.serial.read()
-      if char == b"\n":
-        if self.pending_cmd.startswith(_CMD_PREFIX):
-          self._process_cmd(self.pending_cmd[len(_CMD_PREFIX):])
-        self.pending_cmd = b""
-      else:
-        self.pending_cmd += char
+    # Check if the write thread encountered an error
+    if self._write_error:
+      self.printer.invoke_shutdown(f"Lost connection with {self.name}")
+      self.serial = None
+      return eventtime + _RECV_PERIOD
+
+    while True:
+      data = self.serial.read(256)
+      if not data:
+        break
+      for byte in data:
+        if byte == 0x0A:  # \n
+          line = self.pending_line.strip()
+          if line:
+            self._process_cmd(line)
+          self.pending_line = ""
+        elif byte != 0x0D:  # strip \r
+          self.pending_line += chr(byte)
 
     return eventtime + _RECV_PERIOD
 
@@ -253,7 +285,6 @@ class ZeroD:
     message = message[:_GCODES_MAX_LEN]
     message = message.split("\n")[0]
     message = message.upper()
-    message = message.encode("utf-8")
     self._send_state(PrinterState(
         status=PrinterStatus.SHUTDOWN,
         gcodes=message,
@@ -263,60 +294,70 @@ class ZeroD:
     if not self.serial or not self.serial.is_open:
       return
 
-    msg = _HEADER
-    msg += struct.pack("!I", state.status.value)
-    msg += struct.pack("!?", state.working)
-    msg += struct.pack("!?", state.paused)
-    msg += struct.pack("!?", state.homed_x)
-    msg += struct.pack("!?", state.homed_y)
-    msg += struct.pack("!?", state.homed_z)
-    msg += b'\x00\x00\x00'
-    msg += struct.pack("!i", int(state.hotend_temp))
-    msg += struct.pack("!i", int(state.hotend_target))
-    msg += struct.pack("!i", int(state.bed_temp))
-    msg += struct.pack("!i", int(state.bed_target))
-    msg += struct.pack("!i", int(state.chamber_temp))
-    msg += struct.pack("!i", int(state.chamber_target))
-    msg += struct.pack("!i", int(state.progress))
-    msg += struct.pack("!I", state.tram_type.value)
-    msg += state.gcodes + b"\x00" * (_GCODES_MAX_LEN + 1 - len(state.gcodes))
-    msg += _FOOTER
+    homed = 1 if (state.homed_x or state.homed_y or state.homed_z) else 0
 
-    try:
-      self.serial.write(msg)
-    except serial.SerialException:
-      self.printer.invoke_shutdown(f"Lost connection with {self.name}")
-      self.serial = None
+    # Pipe-delimited status line matching recv_task.cpp parser
+    # Format: S:2|W:1|P:0|H:1|HT:210|HTT:220|B:60|BT:65|C:0|CT:0|PR:45|TR:0|G:...
+    parts = [
+        f"S:{state.status.value}",
+        f"W:{1 if state.working else 0}",
+        f"P:{1 if state.paused else 0}",
+        f"H:{homed}",
+        f"HT:{int(state.hotend_temp)}",
+        f"HTT:{int(state.hotend_target)}",
+        f"B:{int(state.bed_temp)}",
+        f"BT:{int(state.bed_target)}",
+        f"C:{int(state.chamber_temp)}",
+        f"CT:{int(state.chamber_target)}",
+        f"PR:{int(state.progress)}",
+        f"TR:{state.tram_type.value}",
+    ]
+    if state.gcodes:
+      parts.append(f"G:{state.gcodes}")
 
-  def _process_cmd(self, cmd):
+    line = "|".join(parts) + "\n"
+
+    # Push to background thread — never blocks the reactor
     try:
-      if cmd == _CMD_STOP:
+      self._write_queue.put_nowait(line)
+    except queue.Full:
+      pass  # drop update if backlogged
+
+  def _process_cmd(self, line):
+    """Process a command line received from the ESP32-C3 firmware.
+
+    Firmware send_task.cpp sends:
+      GCODE <gcode>
+      MOVE <dir>      (e.g. X+, X-, Y+, Y-, Z+, Z-)
+      STOP
+      RESTART
+    """
+    try:
+      if line == "STOP":
         self.printer.invoke_shutdown(f"Stop requested by {self.name}")
         return
-      if cmd == _CMD_RESTART:
+      if line == "RESTART":
         self.gcode.request_restart("firmware_restart")
         return
-      if cmd.startswith(_CMD_GCODE):
-        gcode = cmd[len(_CMD_GCODE):]
-        self.gcode.run_script(gcode.decode("utf-8"))
+      if line.startswith("GCODE "):
+        gcode = line[6:]
+        self.gcode.run_script(gcode)
         return
-      if cmd.startswith(_CMD_MOVE):
-        axis = {
-            ord("X"): 0,
-            ord("Y"): 1,
-            ord("Z"): 2,
-        }[cmd[-2]]
-        direction = {
-            ord("+"): 1,
-            ord("-"): -1,
-        }[cmd[-1]]
-        pos = self.toolhead.get_position()
-        pos[axis] += self.config_move[axis] * direction
-        self.toolhead.manual_move(pos, self.config_speed[axis])
-    except:
+      if line.startswith("MOVE "):
+        move = line[5:]
+        try:
+          axis_char = move[0].upper()
+          direction_char = move[1]
+          axis = {"X": 0, "Y": 1, "Z": 2}[axis_char]
+          direction = 1 if direction_char == "+" else -1
+          pos = self.toolhead.get_position()
+          pos[axis] += self.config_move[axis] * direction
+          self.toolhead.manual_move(pos, self.config_speed[axis])
+        except (IndexError, KeyError):
+          pass
+    except Exception:
       pass
 
 
 def load_config(config):
-  zerod = ZeroD(config)
-  return zerod
+  return ZeroD(config)
